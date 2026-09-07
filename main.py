@@ -52,7 +52,7 @@ DXY_COEFF = {
 }
 DXY_BASE = 50.14348112
 TIMEFRAMES = [
-    ("3m", "3min", "Scalper", 3),
+    ("3m", "1min", "Scalper", 3),
     ("15m", "15min", "Momentum", 15),
     ("30m", "30min", "Intraday", 30),
     ("1H", "1h", "Swing", 60),
@@ -175,6 +175,22 @@ def fetch_series(symbol, interval, outputsize):
         }
         for x in data["values"]
     ]))
+
+
+def aggregate_ohlc(bars, minutes):
+    """Aggregate lower-timeframe OHLC bars into larger fixed-minute bars."""
+    out = []
+    seconds = minutes * 60
+    for b in bars:
+        bucket = int(b["t"] // seconds) * seconds
+        if not out or out[-1]["t"] != bucket:
+            out.append({"t": bucket, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]})
+        else:
+            x = out[-1]
+            x["h"] = max(x["h"], b["h"])
+            x["l"] = min(x["l"], b["l"])
+            x["c"] = b["c"]
+    return out[-300:]
 
 
 def update_bar(bars, ts, price, minutes):
@@ -389,7 +405,9 @@ async def load_history():
     for tf, interval, _, _ in TIMEFRAMES:
         try:
             market["history_status"][tf]["status"] = "loading"
-            gold = await asyncio.to_thread(fetch_series, GOLD_SYMBOL, interval, HISTORY_OUTPUTSIZE)
+            source_size = HISTORY_OUTPUTSIZE * 3 if tf == "3m" else HISTORY_OUTPUTSIZE
+            gold_raw = await asyncio.to_thread(fetch_series, GOLD_SYMBOL, interval, source_size)
+            gold = aggregate_ohlc(gold_raw, 3) if tf == "3m" else gold_raw
             histories[tf]["gold"] = gold
             add_event(f"History {tf}: Gold {len(gold)} bars loaded.")
             await asyncio.sleep(REST_DELAY_SECONDS)
@@ -397,7 +415,8 @@ async def load_history():
             component_maps = []
             for symbol in FX_SYMBOLS:
                 try:
-                    values = await asyncio.to_thread(fetch_series, symbol, interval, HISTORY_OUTPUTSIZE)
+                    raw_values = await asyncio.to_thread(fetch_series, symbol, interval, source_size)
+                    values = aggregate_ohlc(raw_values, 3) if tf == "3m" else raw_values
                     component_maps.append((symbol, {x["t"]: x["c"] for x in values}))
                     add_event(f"History {tf}: {symbol} {len(values)} bars loaded.")
                 except Exception as exc:
@@ -442,72 +461,85 @@ async def ws_engine():
         try:
             market["feed_status"] = "connecting"
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
-                await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": symbols}}))
+                await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": ",".join(symbols)}}))
                 market["connected"] = True
                 market["feed_status"] = "connected / waiting for prices"
                 add_event("Connected to Twelve Data WebSocket.")
 
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
+                async def heartbeat_loop():
+                    while True:
+                        await asyncio.sleep(10)
+                        await ws.send(json.dumps({"action": "heartbeat"}))
 
-                    event = msg.get("event")
-                    if event == "subscribe-status":
-                        market["subscription_status"] = msg
-                        add_event("SUBSCRIBE STATUS: " + json.dumps(msg, separators=(",", ":"))[:700])
-                        continue
-                    if event == "error":
-                        add_event("TWELVE DATA ERROR: " + json.dumps(msg, separators=(",", ":"))[:700])
-                        continue
-                    if event == "heartbeat":
-                        continue
-                    if event != "price":
-                        # Keep diagnostics for unexpected events.
-                        if event:
-                            add_event("WS EVENT: " + json.dumps(msg, separators=(",", ":"))[:500])
-                        continue
-
-                    symbol_raw = str(msg.get("symbol", "")).upper()
-                    matched = next((s for s in ALL_SYMBOLS if s.upper() == symbol_raw), None)
-                    if not matched:
-                        continue
-                    try:
-                        price = float(msg.get("price"))
-                    except Exception:
-                        continue
-                    if price <= 0:
-                        continue
-
-                    ts = now_ts()
-                    market["updated"] = ts
-                    market["subscriptions"][matched]["received"] = True
-                    market["subscriptions"][matched]["last_price"] = price
-                    market["subscriptions"][matched]["last_update"] = ts
-
-                    if matched == GOLD_SYMBOL:
-                        market["gold"] = price
-                        for tf, _, _, minutes in TIMEFRAMES:
-                            update_bar(histories[tf]["gold"], ts, price, minutes)
-                    else:
-                        market["components"][matched] = price
-                        dxy = calculate_dxy(market["components"])
-                        if dxy is not None:
-                            market["dxy"] = dxy
-                            market["feed_status"] = "live / DXY calculated"
+                heartbeat_task = asyncio.create_task(heartbeat_loop())
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+    
+                        event = msg.get("event")
+                        if event == "subscribe-status":
+                            market["subscription_status"] = msg
+                            add_event("SUBSCRIBE STATUS: " + json.dumps(msg, separators=(",", ":"))[:700])
+                            continue
+                        if event == "error":
+                            add_event("TWELVE DATA ERROR: " + json.dumps(msg, separators=(",", ":"))[:700])
+                            continue
+                        if event == "heartbeat":
+                            continue
+                        if event != "price":
+                            # Keep diagnostics for unexpected events.
+                            if event:
+                                add_event("WS EVENT: " + json.dumps(msg, separators=(",", ":"))[:500])
+                            continue
+    
+                        symbol_raw = str(msg.get("symbol", "")).upper()
+                        matched = next((s for s in ALL_SYMBOLS if s.upper() == symbol_raw), None)
+                        if not matched:
+                            continue
+                        try:
+                            price = float(msg.get("price"))
+                        except Exception:
+                            continue
+                        if price <= 0:
+                            continue
+    
+                        ts = now_ts()
+                        market["updated"] = ts
+                        market["subscriptions"][matched]["received"] = True
+                        market["subscriptions"][matched]["last_price"] = price
+                        market["subscriptions"][matched]["last_update"] = ts
+    
+                        if matched == GOLD_SYMBOL:
+                            market["gold"] = price
                             for tf, _, _, minutes in TIMEFRAMES:
-                                update_bar(histories[tf]["dxy"], ts, dxy, minutes)
-
-                    if market["gold"] is not None and market["dxy"] is not None:
-                        c = corr_returns(
-                            [x["c"] for x in histories["1H"]["dxy"]],
-                            [x["c"] for x in histories["1H"]["gold"]],
-                            50,
-                        )
-                        market["correlation"] = c
-                        run_strategy()
-
+                                update_bar(histories[tf]["gold"], ts, price, minutes)
+                        else:
+                            market["components"][matched] = price
+                            dxy = calculate_dxy(market["components"])
+                            if dxy is not None:
+                                market["dxy"] = dxy
+                                market["feed_status"] = "live / DXY calculated"
+                                for tf, _, _, minutes in TIMEFRAMES:
+                                    update_bar(histories[tf]["dxy"], ts, dxy, minutes)
+    
+                        if market["gold"] is not None and market["dxy"] is not None:
+                            c = corr_returns(
+                                [x["c"] for x in histories["1H"]["dxy"]],
+                                [x["c"] for x in histories["1H"]["gold"]],
+                                50,
+                            )
+                            market["correlation"] = c
+                            run_strategy()
+    
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
         except Exception as exc:
             market["connected"] = False
             market["feed_status"] = "disconnected / retrying"
