@@ -52,7 +52,6 @@ DXY_COEFF = {
 }
 DXY_BASE = 50.14348112
 TIMEFRAMES = [
-    ("3m", "1min", "Scalper", 3),
     ("15m", "15min", "Momentum", 15),
     ("30m", "30min", "Intraday", 30),
     ("1H", "1h", "Swing", 60),
@@ -405,9 +404,9 @@ async def load_history():
     for tf, interval, _, _ in TIMEFRAMES:
         try:
             market["history_status"][tf]["status"] = "loading"
-            source_size = HISTORY_OUTPUTSIZE * 3 if tf == "3m" else HISTORY_OUTPUTSIZE
+            source_size = HISTORY_OUTPUTSIZE
             gold_raw = await asyncio.to_thread(fetch_series, GOLD_SYMBOL, interval, source_size)
-            gold = aggregate_ohlc(gold_raw, 3) if tf == "3m" else gold_raw
+            gold = gold_raw
             histories[tf]["gold"] = gold
             add_event(f"History {tf}: Gold {len(gold)} bars loaded.")
             await asyncio.sleep(REST_DELAY_SECONDS)
@@ -416,7 +415,7 @@ async def load_history():
             for symbol in FX_SYMBOLS:
                 try:
                     raw_values = await asyncio.to_thread(fetch_series, symbol, interval, source_size)
-                    values = aggregate_ohlc(raw_values, 3) if tf == "3m" else raw_values
+                    values = raw_values
                     component_maps.append((symbol, {x["t"]: x["c"] for x in values}))
                     add_event(f"History {tf}: {symbol} {len(values)} bars loaded.")
                 except Exception as exc:
