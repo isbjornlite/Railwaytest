@@ -28,7 +28,14 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
 HISTORY_OUTPUTSIZE = int(os.getenv("HISTORY_OUTPUTSIZE", "100"))
-REST_DELAY_SECONDS = float(os.getenv("REST_DELAY_SECONDS", "7.6"))
+REST_DELAY_SECONDS = float(os.getenv("REST_DELAY_SECONDS", "2.0"))
+HISTORY_BATCH_DELAY_SECONDS = float(os.getenv("HISTORY_BATCH_DELAY_SECONDS", "62"))
+DXY_REST_POLL_SECONDS = float(os.getenv("DXY_REST_POLL_SECONDS", "900"))
+LIVE_WS_MODE = os.getenv("LIVE_WS_MODE", "auto").lower()
+# On Basic/Grow, use REST for the five non-trial DXY components instead of
+# repeatedly reconnecting and consuming trial WebSocket subscriptions.
+# "auto" tries the full WS once; "xau_eur_rest" uses only XAU/USD + EUR/USD WS.
+
 
 GOLD_SYMBOL = "XAU/USD"
 FX_SYMBOLS = ["EUR/USD", "USD/JPY", "GBP/USD", "USD/CAD", "USD/SEK", "USD/CHF"]
@@ -175,6 +182,52 @@ def fetch_series(symbol, interval, outputsize):
         for x in data["values"]
     ]))
 
+
+def _parse_values(values):
+    return list(reversed([
+        {
+            "t": parse_time(x["datetime"]),
+            "o": float(x["open"]),
+            "h": float(x["high"]),
+            "l": float(x["low"]),
+            "c": float(x["close"]),
+        }
+        for x in values
+    ]))
+
+
+def fetch_series_batch(symbols, interval, outputsize):
+    """One batch request for several symbols. Each symbol still costs 1 API credit."""
+    query = urllib.parse.urlencode(
+        {
+            "symbol": ",".join(symbols),
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": API_KEY,
+            "format": "JSON",
+        }
+    )
+    data = rest_json("https://api.twelvedata.com/time_series?" + query)
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise RuntimeError(data.get("message", "Twelve Data batch history error"))
+
+    out = {}
+    # Batch responses are keyed by symbol. Be tolerant of symbol casing.
+    for symbol in symbols:
+        payload = data.get(symbol)
+        if payload is None:
+            payload = data.get(symbol.upper())
+        if payload is None:
+            # Try normalized slash/case matching.
+            for key, value in data.items():
+                if str(key).upper() == symbol.upper():
+                    payload = value
+                    break
+        if not isinstance(payload, dict) or "values" not in payload:
+            msg = payload.get("message", "missing values") if isinstance(payload, dict) else "missing symbol"
+            raise RuntimeError(f"{symbol}: {msg}")
+        out[symbol] = _parse_values(payload["values"])
+    return out
 
 def aggregate_ohlc(bars, minutes):
     """Aggregate lower-timeframe OHLC bars into larger fixed-minute bars."""
@@ -397,54 +450,91 @@ async def load_history():
         market["history_status"] = {tf: {"gold_bars": 0, "dxy_bars": 0, "status": "missing API key"} for tf, _, _, _ in TIMEFRAMES}
         return
 
-    add_event(f"History loader started. {len(ALL_SYMBOLS)} symbols x {len(TIMEFRAMES)} timeframes. REST delay={REST_DELAY_SECONDS}s.")
+    add_event(
+        f"Optimized history loader: {len(ALL_SYMBOLS)} symbols x {len(TIMEFRAMES)} timeframes "
+        f"using 1 batch request per timeframe. Batch delay={HISTORY_BATCH_DELAY_SECONDS}s."
+    )
 
-    # Sequential requests are intentional: they reduce the chance of hitting the
-    # user's Twelve Data per-minute credit limit.
-    for tf, interval, _, _ in TIMEFRAMES:
+    for idx, (tf, interval, _, _) in enumerate(TIMEFRAMES):
         try:
             market["history_status"][tf]["status"] = "loading"
-            source_size = HISTORY_OUTPUTSIZE
-            gold_raw = await asyncio.to_thread(fetch_series, GOLD_SYMBOL, interval, source_size)
-            gold = gold_raw
+            batch = await asyncio.to_thread(
+                fetch_series_batch, ALL_SYMBOLS, interval, HISTORY_OUTPUTSIZE
+            )
+            gold = batch[GOLD_SYMBOL]
             histories[tf]["gold"] = gold
-            add_event(f"History {tf}: Gold {len(gold)} bars loaded.")
-            await asyncio.sleep(REST_DELAY_SECONDS)
+            add_event(f"History {tf}: batch loaded {len(ALL_SYMBOLS)} symbols; Gold {len(gold)} bars.")
 
             component_maps = []
             for symbol in FX_SYMBOLS:
-                try:
-                    raw_values = await asyncio.to_thread(fetch_series, symbol, interval, source_size)
-                    values = raw_values
-                    component_maps.append((symbol, {x["t"]: x["c"] for x in values}))
-                    add_event(f"History {tf}: {symbol} {len(values)} bars loaded.")
-                except Exception as exc:
-                    add_event(f"History {tf}: {symbol} FAILED: {type(exc).__name__}: {str(exc)[:150]}")
-                    component_maps = []
-                    break
-                await asyncio.sleep(REST_DELAY_SECONDS)
+                values = batch.get(symbol, [])
+                if not values:
+                    raise RuntimeError(f"{symbol}: empty batch result")
+                component_maps.append((symbol, {x["t"]: x["c"] for x in values}))
 
-            if len(component_maps) == len(FX_SYMBOLS):
-                common = set(component_maps[0][1])
-                for _, mapping in component_maps[1:]:
-                    common &= set(mapping)
-                dxy_bars = []
-                for ts in sorted(common):
-                    prices = {symbol: mapping[ts] for symbol, mapping in component_maps}
-                    value = calculate_dxy(prices)
-                    if value:
-                        dxy_bars.append({"t": ts, "o": value, "h": value, "l": value, "c": value})
-                histories[tf]["dxy"] = dxy_bars[-300:]
-                market["history_status"][tf] = {"gold_bars": len(gold), "dxy_bars": len(dxy_bars), "status": "ready"}
-                add_event(f"History {tf}: DXY reconstructed with {len(dxy_bars)} common bars.")
-            else:
-                market["history_status"][tf]["status"] = "DXY components incomplete"
+            common = set(component_maps[0][1])
+            for _, mapping in component_maps[1:]:
+                common &= set(mapping)
+            dxy_bars = []
+            for ts in sorted(common):
+                prices = {symbol: mapping[ts] for symbol, mapping in component_maps}
+                value = calculate_dxy(prices)
+                if value:
+                    dxy_bars.append({"t": ts, "o": value, "h": value, "l": value, "c": value})
 
+            histories[tf]["dxy"] = dxy_bars[-300:]
+            market["history_status"][tf] = {
+                "gold_bars": len(gold),
+                "dxy_bars": len(dxy_bars),
+                "status": "ready",
+            }
+            add_event(f"History {tf}: DXY reconstructed with {len(dxy_bars)} common bars.")
+
+            if idx < len(TIMEFRAMES) - 1:
+                await asyncio.sleep(HISTORY_BATCH_DELAY_SECONDS)
         except Exception as exc:
             market["history_status"][tf]["status"] = "failed"
             add_event(f"History {tf} FAILED: {type(exc).__name__}: {str(exc)[:180]}")
 
-    add_event("History loader finished.")
+    add_event("Optimized history loader finished.")
+
+
+async def dxy_rest_poll():
+    """Low-frequency DXY refresh for Basic/Grow plans.
+    One batch request = 7 API credits. At 15 minutes this is ~672 credits/day,
+    leaving room under the Basic 800/day limit after the one-time history load.
+    """
+    if not API_KEY:
+        return
+    while True:
+        try:
+            batch = await asyncio.to_thread(
+                fetch_series_batch, FX_SYMBOLS, "1min", 1
+            )
+            prices = {}
+            for symbol, values in batch.items():
+                if values:
+                    prices[symbol] = values[-1]["c"]
+            dxy = calculate_dxy(prices)
+            if dxy is not None:
+                market["dxy"] = dxy
+                market["components"].update(prices)
+                market["updated"] = now_ts()
+                market["feed_status"] = "REST DXY refresh"
+                for symbol, price in prices.items():
+                    sub = market["subscriptions"][symbol]
+                    sub["last_price"] = price
+                    sub["last_update"] = now_ts()
+                for tf, _, _, minutes in TIMEFRAMES:
+                    update_bar(histories[tf]["dxy"], now_ts(), dxy, minutes)
+                add_event(f"REST DXY refresh: {dxy:.3f} from {len(prices)}/6 FX components.")
+                if market["gold"] is not None:
+                    run_strategy()
+            else:
+                add_event(f"REST DXY refresh incomplete: {len(prices)}/6 FX components.")
+        except Exception as exc:
+            add_event(f"REST DXY refresh FAILED: {type(exc).__name__}: {str(exc)[:160]}")
+        await asyncio.sleep(DXY_REST_POLL_SECONDS)
 
 
 async def ws_engine():
@@ -453,7 +543,15 @@ async def ws_engine():
         return
 
     url = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={API_KEY}"
-    symbols = WS_SYMBOLS
+    if LIVE_WS_MODE == "xau_eur_rest":
+        symbols = [GOLD_SYMBOL, "EUR/USD"]
+    elif LIVE_WS_MODE == "auto":
+        # Start with only the two symbols already confirmed by the Basic trial.
+        # This prevents a reconnect loop from repeatedly attempting five rejected
+        # DXY component subscriptions.
+        symbols = [GOLD_SYMBOL, "EUR/USD"]
+    else:
+        symbols = WS_SYMBOLS
     add_event(f"WebSocket target symbols ({len(symbols)}): {','.join(symbols)}")
 
     while True:
@@ -550,9 +648,14 @@ async def ws_engine():
 async def lifespan(app):
     history_task = asyncio.create_task(load_history())
     ws_task = asyncio.create_task(ws_engine())
+    dxy_poll_task = None
+    if LIVE_WS_MODE in {"auto", "xau_eur_rest"}:
+        dxy_poll_task = asyncio.create_task(dxy_rest_poll())
     yield
     history_task.cancel()
     ws_task.cancel()
+    if dxy_poll_task:
+        dxy_poll_task.cancel()
 
 
 app = FastAPI(title="DXY Gold AI Paper Traders", lifespan=lifespan)
@@ -595,6 +698,9 @@ def state():
             "risk_pct": RISK_PCT * 100,
             "correlation_filter": USE_CORRELATION_FILTER,
             "max_setup_age_bars": MAX_SETUP_AGE,
+            "optimized_data_mode": LIVE_WS_MODE,
+            "history_batch_delay_seconds": HISTORY_BATCH_DELAY_SECONDS,
+            "dxy_rest_poll_seconds": DXY_REST_POLL_SECONDS,
         },
         "market": market,
         "agents": list(agents.values()),
