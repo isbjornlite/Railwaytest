@@ -1,728 +1,177 @@
-import os, asyncio, json, time, math, urllib.parse, urllib.request
-from contextlib import asynccontextmanager
-from datetime import datetime
-from fastapi import FastAPI
+import os
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from threading import Lock
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-import websockets
 
-# ============================================================
-# DXY x GOLD — PAPER STRATEGY ENGINE / DIAGNOSTIC BUILD
-# ============================================================
-# PAPER ONLY. No broker and no real orders.
-
-API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 START_BALANCE = float(os.getenv("START_BALANCE", "10000"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))
-MAX_POSITION_NOTIONAL = float(os.getenv("MAX_POSITION_NOTIONAL", "25000"))
-EXIT_REVERSAL_PCT = float(os.getenv("EXIT_REVERSAL_PERCENT", "0.30")) / 100.0
-IMPULSE_BARS = int(os.getenv("IMPULSE_BARS", "10"))
-MIN_IMPULSE_ATR = float(os.getenv("MIN_DXY_IMPULSE_ATR", "2.0"))
-MAX_GOLD_MOVE_ATR = float(os.getenv("MAX_GOLD_MOVE_ATR", "0.75"))
-RETRACE_PCT = float(os.getenv("DXY_RETRACE_PERCENT", "50")) / 100.0
-MAX_SETUP_AGE = int(os.getenv("MAX_SETUP_AGE_BARS", "30"))
-CONFIRMATIONS_NEEDED = int(os.getenv("CONFIRMATIONS_NEEDED", "2"))
-USE_CORRELATION_FILTER = os.getenv("USE_CORRELATION_FILTER", "false").lower() == "true"
-MIN_CORRELATION = float(os.getenv("MIN_CORRELATION", "-0.20"))
-EMA_FAST = int(os.getenv("EMA_FAST", "20"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
-RSI_LEN = int(os.getenv("RSI_LEN", "14"))
-ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-HISTORY_OUTPUTSIZE = int(os.getenv("HISTORY_OUTPUTSIZE", "100"))
-REST_DELAY_SECONDS = float(os.getenv("REST_DELAY_SECONDS", "2.0"))
-HISTORY_BATCH_DELAY_SECONDS = float(os.getenv("HISTORY_BATCH_DELAY_SECONDS", "62"))
-DXY_REST_POLL_SECONDS = float(os.getenv("DXY_REST_POLL_SECONDS", "900"))
-LIVE_WS_MODE = os.getenv("LIVE_WS_MODE", "auto").lower()
-# On Basic/Grow, use REST for the five non-trial DXY components instead of
-# repeatedly reconnecting and consuming trial WebSocket subscriptions.
-# "auto" tries the full WS once; "xau_eur_rest" uses only XAU/USD + EUR/USD WS.
+WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "CHANGE_ME")
+RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "4"))
 
+TIMEFRAMES = ["15m", "30m", "1H", "4H"]
+AGENT_NAMES = {"15m": "Momentum", "30m": "Intraday", "1H": "Swing", "4H": "Macro"}
 
-GOLD_SYMBOL = "XAU/USD"
-FX_SYMBOLS = ["EUR/USD", "USD/JPY", "GBP/USD", "USD/CAD", "USD/SEK", "USD/CHF"]
-ALL_SYMBOLS = [GOLD_SYMBOL] + FX_SYMBOLS
+app = FastAPI(title="DXY Gold TradingView Paper Engine", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
-# If an old TD_SYMBOLS contains DXY/UUP, ignore it and use exactly what the
-# strategy needs. Otherwise honor an explicit complete list.
-raw_symbols = [x.strip() for x in os.getenv("TD_SYMBOLS", "").split(",") if x.strip()]
-if not raw_symbols or any(x.upper() in {"DXY", "UUP"} for x in raw_symbols):
-    WS_SYMBOLS = ALL_SYMBOLS
-else:
-    WS_SYMBOLS = raw_symbols
-
-DXY_COEFF = {
-    "EUR/USD": -0.576,
-    "USD/JPY": 0.136,
-    "GBP/USD": -0.119,
-    "USD/CAD": 0.091,
-    "USD/SEK": 0.042,
-    "USD/CHF": 0.036,
-}
-DXY_BASE = 50.14348112
-TIMEFRAMES = [
-    ("15m", "15min", "Momentum", 15),
-    ("30m", "30min", "Intraday", 30),
-    ("1H", "1h", "Swing", 60),
-    ("4H", "4h", "Macro", 240),
-]
-
-
-def now_ts():
-    return time.time()
-
-
-def add_event(msg):
-    line = str(msg)[:500]
-    events.insert(0, {"ts": time.strftime("%H:%M:%S"), "msg": line})
-    del events[100:]
-    print(f"[DXY-GOLD] {line}", flush=True)
-
-
-def parse_time(value):
-    try:
-        if isinstance(value, (int, float)):
-            return float(value)
-        s = str(value).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return now_ts()
-
-
-def calculate_dxy(prices):
-    if not all(s in prices and prices[s] > 0 for s in FX_SYMBOLS):
-        return None
-    value = DXY_BASE
-    try:
-        for symbol, exponent in DXY_COEFF.items():
-            value *= prices[symbol] ** exponent
-        return float(value)
-    except Exception:
-        return None
-
-
-def sma(values, n):
-    return sum(values[-n:]) / n if len(values) >= n else None
-
-
-def ema(values, n):
-    if len(values) < n:
-        return None
-    k = 2 / (n + 1)
-    e = sum(values[:n]) / n
-    for x in values[n:]:
-        e = x * k + e * (1 - k)
-    return e
-
-
-def atr(bars, n=14):
-    if len(bars) < n + 1:
-        return None
-    trs = []
-    for i in range(1, len(bars)):
-        b, p = bars[i], bars[i - 1]
-        trs.append(max(b["h"] - b["l"], abs(b["h"] - p["c"]), abs(b["l"] - p["c"])))
-    return sum(trs[-n:]) / n if len(trs) >= n else None
-
-
-def rsi(values, n=14):
-    if len(values) < n + 1:
-        return None
-    gains, losses = [], []
-    for i in range(len(values) - n, len(values)):
-        d = values[i] - values[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_gain = sum(gains) / n
-    avg_loss = sum(losses) / n
-    if avg_loss == 0:
-        return 100.0
-    return 100 - 100 / (1 + avg_gain / avg_loss)
-
-
-def corr_returns(a, b, n=50):
-    if len(a) < n + 1 or len(b) < n + 1:
-        return None
-    ar = [(a[i] / a[i - 1] - 1) for i in range(len(a) - n, len(a))]
-    br = [(b[i] / b[i - 1] - 1) for i in range(len(b) - n, len(b))]
-    ma, mb = sum(ar) / n, sum(br) / n
-    num = sum((x - ma) * (y - mb) for x, y in zip(ar, br))
-    da = sum((x - ma) ** 2 for x in ar)
-    db = sum((y - mb) ** 2 for y in br)
-    return num / math.sqrt(da * db) if da and db else None
-
-
-def rest_json(url):
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "DXY-Gold-Paper-Traders/diagnostic"}
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode())
-
-
-def fetch_series(symbol, interval, outputsize):
-    query = urllib.parse.urlencode(
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize,
-            "apikey": API_KEY,
-            "format": "JSON",
-        }
-    )
-    data = rest_json("https://api.twelvedata.com/time_series?" + query)
-    if data.get("status") == "error" or "values" not in data:
-        raise RuntimeError(data.get("message", "Twelve Data history error"))
-    return list(reversed([
-        {
-            "t": parse_time(x["datetime"]),
-            "o": float(x["open"]),
-            "h": float(x["high"]),
-            "l": float(x["low"]),
-            "c": float(x["close"]),
-        }
-        for x in data["values"]
-    ]))
-
-
-def _parse_values(values):
-    return list(reversed([
-        {
-            "t": parse_time(x["datetime"]),
-            "o": float(x["open"]),
-            "h": float(x["high"]),
-            "l": float(x["low"]),
-            "c": float(x["close"]),
-        }
-        for x in values
-    ]))
-
-
-def fetch_series_batch(symbols, interval, outputsize):
-    """One batch request for several symbols. Each symbol still costs 1 API credit."""
-    query = urllib.parse.urlencode(
-        {
-            "symbol": ",".join(symbols),
-            "interval": interval,
-            "outputsize": outputsize,
-            "apikey": API_KEY,
-            "format": "JSON",
-        }
-    )
-    data = rest_json("https://api.twelvedata.com/time_series?" + query)
-    if isinstance(data, dict) and data.get("status") == "error":
-        raise RuntimeError(data.get("message", "Twelve Data batch history error"))
-
-    out = {}
-    # Batch responses are keyed by symbol. Be tolerant of symbol casing.
-    for symbol in symbols:
-        payload = data.get(symbol)
-        if payload is None:
-            payload = data.get(symbol.upper())
-        if payload is None:
-            # Try normalized slash/case matching.
-            for key, value in data.items():
-                if str(key).upper() == symbol.upper():
-                    payload = value
-                    break
-        if not isinstance(payload, dict) or "values" not in payload:
-            msg = payload.get("message", "missing values") if isinstance(payload, dict) else "missing symbol"
-            raise RuntimeError(f"{symbol}: {msg}")
-        out[symbol] = _parse_values(payload["values"])
-    return out
-
-def aggregate_ohlc(bars, minutes):
-    """Aggregate lower-timeframe OHLC bars into larger fixed-minute bars."""
-    out = []
-    seconds = minutes * 60
-    for b in bars:
-        bucket = int(b["t"] // seconds) * seconds
-        if not out or out[-1]["t"] != bucket:
-            out.append({"t": bucket, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]})
-        else:
-            x = out[-1]
-            x["h"] = max(x["h"], b["h"])
-            x["l"] = min(x["l"], b["l"])
-            x["c"] = b["c"]
-    return out[-300:]
-
-
-def update_bar(bars, ts, price, minutes):
-    bucket = int(ts // (minutes * 60)) * (minutes * 60)
-    if not bars or bars[-1]["t"] != bucket:
-        bars.append({"t": bucket, "o": price, "h": price, "l": price, "c": price})
-    else:
-        b = bars[-1]
-        b["h"] = max(b["h"], price)
-        b["l"] = min(b["l"], price)
-        b["c"] = price
-    if len(bars) > 300:
-        del bars[:-300]
-
-
-agents = {
-    tf: {
-        "name": name,
-        "timeframe": tf,
-        "balance": START_BALANCE,
-        "equity": START_BALANCE,
-        "pnl": 0.0,
-        "position": None,
-        "trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "last_signal": None,
-        "setup": None,
-        "bars": 0,
-        "correlation": None,
+lock = Lock()
+events = deque(maxlen=150)
+agents = {}
+for tf in TIMEFRAMES:
+    agents[tf] = {
+        "timeframe": tf, "name": AGENT_NAMES[tf], "balance": START_BALANCE,
+        "equity": START_BALANCE, "pnl": 0.0, "position": "FLAT",
+        "qty": 0.0, "entry": None, "stop": None, "last_price": None,
+        "last_dxy": None, "last_update": None, "trades": 0, "wins": 0, "losses": 0,
+        "last_signal": None
     }
-    for tf, _, name, _ in TIMEFRAMES
-}
 
 market = {
-    "dxy": None,
-    "gold": None,
-    "updated": None,
-    "connected": False,
-    "dxy_source": "ICE DXY reconstructed from 6 FX components",
-    "components": {},
-    "correlation": None,
-    "feed_status": "starting",
-    "subscription_status": None,
-    "subscriptions": {s: {"requested": s in WS_SYMBOLS, "received": False, "last_price": None, "last_update": None} for s in ALL_SYMBOLS},
-    "history_status": {tf: {"gold_bars": 0, "dxy_bars": 0, "status": "waiting"} for tf, _, _, _ in TIMEFRAMES},
+    "gold": None, "dxy": None, "correlation": None, "source": "TradingView",
+    "last_update": None, "feed_status": "WAITING_FOR_TRADINGVIEW"
 }
 
-events = []
-histories = {tf: {"gold": [], "dxy": []} for tf, _, _, _ in TIMEFRAMES}
+def add_event(msg, payload=None):
+    item = {"time": datetime.now(timezone.utc).isoformat(), "message": msg, "payload": payload}
+    with lock:
+        events.appendleft(item)
+    print(f"[TV-PAPER] {msg}", flush=True)
 
-
-def signal_for(tf):
-    a = agents[tf]
-    gold = histories[tf]["gold"]
-    dxy = histories[tf]["dxy"]
-    minimum = max(60, IMPULSE_BARS + ATR_LEN + 5)
-    if len(gold) < minimum or len(dxy) < minimum:
-        return None
-
-    gc = [x["c"] for x in gold]
-    dc = [x["c"] for x in dxy]
-    gold_atr = atr(gold, ATR_LEN)
-    dxy_atr = atr(dxy, ATR_LEN)
-    if not gold_atr or not dxy_atr:
-        return None
-
-    start = -IMPULSE_BARS - 1
-    old_d = dc[start]
-    new_d = dc[-1]
-    impulse = new_d - old_d
-    impulse_atr = abs(impulse) / dxy_atr
-    gold_move = abs(gc[-1] - gc[start]) / gold_atr
-
-    if impulse_atr < MIN_IMPULSE_ATR or gold_move > MAX_GOLD_MOVE_ATR:
-        return None
-
-    dxy_direction = 1 if impulse > 0 else -1
-    expected_gold = -dxy_direction
-    window = dc[start:]
-    high, low = max(window), min(window)
-
-    if dxy_direction > 0:
-        denominator = high - old_d
-        retrace = (high - dc[-1]) / denominator if denominator > 0 else 0
-    else:
-        denominator = old_d - low
-        retrace = (dc[-1] - low) / denominator if denominator > 0 else 0
-
-    if retrace < RETRACE_PCT:
-        return None
-
-    ef, es, rv = ema(gc, EMA_FAST), ema(gc, EMA_SLOW), rsi(gc, RSI_LEN)
-    confirmations = 0
-    reasons = []
-
-    if expected_gold > 0 and ef is not None and es is not None and ef >= es:
-        confirmations += 1; reasons.append("EMA bullish")
-    if expected_gold < 0 and ef is not None and es is not None and ef <= es:
-        confirmations += 1; reasons.append("EMA bearish")
-    if rv is not None and ((expected_gold > 0 and rv >= 50) or (expected_gold < 0 and rv <= 50)):
-        confirmations += 1; reasons.append("RSI aligned")
-    if expected_gold > 0 and gc[-1] >= gold[-1]["o"]:
-        confirmations += 1; reasons.append("bull candle")
-    if expected_gold < 0 and gc[-1] <= gold[-1]["o"]:
-        confirmations += 1; reasons.append("bear candle")
-
-    correlation = corr_returns(dc, gc, 50)
-    a["correlation"] = correlation
-    if USE_CORRELATION_FILTER and (correlation is None or correlation > MIN_CORRELATION):
-        return None
-    if confirmations < CONFIRMATIONS_NEEDED:
-        return None
-
-    return {
-        "side": "LONG" if expected_gold > 0 else "SHORT",
-        "price": gc[-1],
-        "dxy": dc[-1],
-        "impulse_atr": round(impulse_atr, 2),
-        "gold_move_atr": round(gold_move, 2),
-        "retrace": round(retrace * 100, 1),
-        "confirmations": confirmations,
-        "reasons": reasons,
-        "atr": gold_atr,
-        "correlation": correlation,
-    }
-
-
-def open_trade(tf, signal):
-    a = agents[tf]
-    if a["position"] is not None:
-        return
-    risk_cash = max(a["balance"], 0) * RISK_PCT
-    stop_distance = max(signal["atr"] * 1.5, 0.5)
-    qty = min(risk_cash / stop_distance, MAX_POSITION_NOTIONAL / signal["price"])
-    if qty <= 0:
-        return
-
-    a["position"] = {
-        "side": signal["side"],
-        "entry": signal["price"],
-        "qty": qty,
-        "entry_dxy": signal["dxy"],
-        "stop": signal["price"] - stop_distance if signal["side"] == "LONG" else signal["price"] + stop_distance,
-        "best_dxy": signal["dxy"],
-        "opened": now_ts(),
-        "risk": risk_cash,
-    }
-    a["last_signal"] = signal
-    a["trades"] += 1
-    add_event(f"{a['name']} {tf}: PAPER {signal['side']} XAU/USD @ {signal['price']:.2f} | DXY retrace {signal['retrace']:.1f}%")
-
-
-def manage_trade(tf):
-    a = agents[tf]
-    p = a["position"]
-    if not p or market["gold"] is None or market["dxy"] is None:
-        return
-
-    gold = market["gold"]
-    dxy = market["dxy"]
-    side = p["side"]
-    p["best_dxy"] = min(p["best_dxy"], dxy) if side == "LONG" else max(p["best_dxy"], dxy)
-
-    if side == "LONG":
-        unrealized = (gold - p["entry"]) * p["qty"]
-        stop_hit = gold <= p["stop"]
-        reversal_hit = dxy >= p["best_dxy"] * (1 + EXIT_REVERSAL_PCT)
-    else:
-        unrealized = (p["entry"] - gold) * p["qty"]
-        stop_hit = gold >= p["stop"]
-        reversal_hit = dxy <= p["best_dxy"] * (1 - EXIT_REVERSAL_PCT)
-
-    a["equity"] = a["balance"] + unrealized
-    a["pnl"] = a["equity"] - START_BALANCE
-
-    reason = "ATR stop" if stop_hit else ("DXY reversal" if reversal_hit else None)
-    if reason:
-        a["balance"] += unrealized
-        a["equity"] = a["balance"]
-        a["pnl"] = a["balance"] - START_BALANCE
-        if unrealized >= 0:
-            a["wins"] += 1
-        else:
-            a["losses"] += 1
-        add_event(f"{a['name']} {tf}: EXIT {side} @ {gold:.2f} | {reason} | P/L {unrealized:+.2f}")
-        a["position"] = None
-
-
-def run_strategy():
-    if market["gold"] is None or market["dxy"] is None:
-        return
-    for tf, _, _, _ in TIMEFRAMES:
-        manage_trade(tf)
-        if agents[tf]["position"] is None:
-            sig = signal_for(tf)
-            if sig:
-                open_trade(tf, sig)
-        agents[tf]["bars"] = len(histories[tf]["gold"])
-
-
-async def load_history():
-    if not API_KEY:
-        add_event("ERROR: TWELVE_DATA_API_KEY is missing.")
-        market["history_status"] = {tf: {"gold_bars": 0, "dxy_bars": 0, "status": "missing API key"} for tf, _, _, _ in TIMEFRAMES}
-        return
-
-    add_event(
-        f"Optimized history loader: {len(ALL_SYMBOLS)} symbols x {len(TIMEFRAMES)} timeframes "
-        f"using 1 batch request per timeframe. Batch delay={HISTORY_BATCH_DELAY_SECONDS}s."
-    )
-
-    for idx, (tf, interval, _, _) in enumerate(TIMEFRAMES):
-        try:
-            market["history_status"][tf]["status"] = "loading"
-            batch = await asyncio.to_thread(
-                fetch_series_batch, ALL_SYMBOLS, interval, HISTORY_OUTPUTSIZE
-            )
-            gold = batch[GOLD_SYMBOL]
-            histories[tf]["gold"] = gold
-            add_event(f"History {tf}: batch loaded {len(ALL_SYMBOLS)} symbols; Gold {len(gold)} bars.")
-
-            component_maps = []
-            for symbol in FX_SYMBOLS:
-                values = batch.get(symbol, [])
-                if not values:
-                    raise RuntimeError(f"{symbol}: empty batch result")
-                component_maps.append((symbol, {x["t"]: x["c"] for x in values}))
-
-            common = set(component_maps[0][1])
-            for _, mapping in component_maps[1:]:
-                common &= set(mapping)
-            dxy_bars = []
-            for ts in sorted(common):
-                prices = {symbol: mapping[ts] for symbol, mapping in component_maps}
-                value = calculate_dxy(prices)
-                if value:
-                    dxy_bars.append({"t": ts, "o": value, "h": value, "l": value, "c": value})
-
-            histories[tf]["dxy"] = dxy_bars[-300:]
-            market["history_status"][tf] = {
-                "gold_bars": len(gold),
-                "dxy_bars": len(dxy_bars),
-                "status": "ready",
-            }
-            add_event(f"History {tf}: DXY reconstructed with {len(dxy_bars)} common bars.")
-
-            if idx < len(TIMEFRAMES) - 1:
-                await asyncio.sleep(HISTORY_BATCH_DELAY_SECONDS)
-        except Exception as exc:
-            market["history_status"][tf]["status"] = "failed"
-            add_event(f"History {tf} FAILED: {type(exc).__name__}: {str(exc)[:180]}")
-
-    add_event("Optimized history loader finished.")
-
-
-async def dxy_rest_poll():
-    """Low-frequency DXY refresh for Basic/Grow plans.
-    One batch request = 7 API credits. At 15 minutes this is ~672 credits/day,
-    leaving room under the Basic 800/day limit after the one-time history load.
-    """
-    if not API_KEY:
-        return
-    while True:
-        try:
-            batch = await asyncio.to_thread(
-                fetch_series_batch, FX_SYMBOLS, "1min", 1
-            )
-            prices = {}
-            for symbol, values in batch.items():
-                if values:
-                    prices[symbol] = values[-1]["c"]
-            dxy = calculate_dxy(prices)
-            if dxy is not None:
-                market["dxy"] = dxy
-                market["components"].update(prices)
-                market["updated"] = now_ts()
-                market["feed_status"] = "REST DXY refresh"
-                for symbol, price in prices.items():
-                    sub = market["subscriptions"][symbol]
-                    sub["last_price"] = price
-                    sub["last_update"] = now_ts()
-                for tf, _, _, minutes in TIMEFRAMES:
-                    update_bar(histories[tf]["dxy"], now_ts(), dxy, minutes)
-                add_event(f"REST DXY refresh: {dxy:.3f} from {len(prices)}/6 FX components.")
-                if market["gold"] is not None:
-                    run_strategy()
-            else:
-                add_event(f"REST DXY refresh incomplete: {len(prices)}/6 FX components.")
-        except Exception as exc:
-            add_event(f"REST DXY refresh FAILED: {type(exc).__name__}: {str(exc)[:160]}")
-        await asyncio.sleep(DXY_REST_POLL_SECONDS)
-
-
-async def ws_engine():
-    if not API_KEY:
-        market["feed_status"] = "missing API key"
-        return
-
-    url = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={API_KEY}"
-    if LIVE_WS_MODE == "xau_eur_rest":
-        symbols = [GOLD_SYMBOL, "EUR/USD"]
-    elif LIVE_WS_MODE == "auto":
-        # Start with only the two symbols already confirmed by the Basic trial.
-        # This prevents a reconnect loop from repeatedly attempting five rejected
-        # DXY component subscriptions.
-        symbols = [GOLD_SYMBOL, "EUR/USD"]
-    else:
-        symbols = WS_SYMBOLS
-    add_event(f"WebSocket target symbols ({len(symbols)}): {','.join(symbols)}")
-
-    while True:
-        try:
-            market["feed_status"] = "connecting"
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
-                await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": ",".join(symbols)}}))
-                market["connected"] = True
-                market["feed_status"] = "connected / waiting for prices"
-                add_event("Connected to Twelve Data WebSocket.")
-
-                async def heartbeat_loop():
-                    while True:
-                        await asyncio.sleep(10)
-                        await ws.send(json.dumps({"action": "heartbeat"}))
-
-                heartbeat_task = asyncio.create_task(heartbeat_loop())
-                try:
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-    
-                        event = msg.get("event")
-                        if event == "subscribe-status":
-                            market["subscription_status"] = msg
-                            add_event("SUBSCRIBE STATUS: " + json.dumps(msg, separators=(",", ":"))[:700])
-                            continue
-                        if event == "error":
-                            add_event("TWELVE DATA ERROR: " + json.dumps(msg, separators=(",", ":"))[:700])
-                            continue
-                        if event == "heartbeat":
-                            continue
-                        if event != "price":
-                            # Keep diagnostics for unexpected events.
-                            if event:
-                                add_event("WS EVENT: " + json.dumps(msg, separators=(",", ":"))[:500])
-                            continue
-    
-                        symbol_raw = str(msg.get("symbol", "")).upper()
-                        matched = next((s for s in ALL_SYMBOLS if s.upper() == symbol_raw), None)
-                        if not matched:
-                            continue
-                        try:
-                            price = float(msg.get("price"))
-                        except Exception:
-                            continue
-                        if price <= 0:
-                            continue
-    
-                        ts = now_ts()
-                        market["updated"] = ts
-                        market["subscriptions"][matched]["received"] = True
-                        market["subscriptions"][matched]["last_price"] = price
-                        market["subscriptions"][matched]["last_update"] = ts
-    
-                        if matched == GOLD_SYMBOL:
-                            market["gold"] = price
-                            for tf, _, _, minutes in TIMEFRAMES:
-                                update_bar(histories[tf]["gold"], ts, price, minutes)
-                        else:
-                            market["components"][matched] = price
-                            dxy = calculate_dxy(market["components"])
-                            if dxy is not None:
-                                market["dxy"] = dxy
-                                market["feed_status"] = "live / DXY calculated"
-                                for tf, _, _, minutes in TIMEFRAMES:
-                                    update_bar(histories[tf]["dxy"], ts, dxy, minutes)
-    
-                        if market["gold"] is not None and market["dxy"] is not None:
-                            c = corr_returns(
-                                [x["c"] for x in histories["1H"]["dxy"]],
-                                [x["c"] for x in histories["1H"]["gold"]],
-                                50,
-                            )
-                            market["correlation"] = c
-                            run_strategy()
-    
-                finally:
-                    heartbeat_task.cancel()
-                    try:
-                        await heartbeat_task
-                    except asyncio.CancelledError:
-                        pass
-        except Exception as exc:
-            market["connected"] = False
-            market["feed_status"] = "disconnected / retrying"
-            add_event(f"WebSocket ERROR: {type(exc).__name__}: {str(exc)[:180]}")
-            await asyncio.sleep(5)
-
-
-@asynccontextmanager
-async def lifespan(app):
-    history_task = asyncio.create_task(load_history())
-    ws_task = asyncio.create_task(ws_engine())
-    dxy_poll_task = None
-    if LIVE_WS_MODE in {"auto", "xau_eur_rest"}:
-        dxy_poll_task = asyncio.create_task(dxy_rest_poll())
-    yield
-    history_task.cancel()
-    ws_task.cancel()
-    if dxy_poll_task:
-        dxy_poll_task.cancel()
-
-
-app = FastAPI(title="DXY Gold AI Paper Traders", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+def reset_all():
+    with lock:
+        for tf in TIMEFRAMES:
+            a = agents[tf]
+            a.update({
+                "balance": START_BALANCE, "equity": START_BALANCE, "pnl": 0.0,
+                "position": "FLAT", "qty": 0.0, "entry": None, "stop": None,
+                "last_price": None, "last_dxy": None, "last_update": None,
+                "trades": 0, "wins": 0, "losses": 0, "last_signal": None
+            })
 
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "mode": "PAPER_ONLY",
-        "message": "DXY Gold paper-trading strategy backend is online.",
-        "dxy_source": market["dxy_source"],
-        "feed_status": market["feed_status"],
-    }
-
+    return {"ok": True, "service": "DXY Gold TradingView Paper Engine", "timeframes": TIMEFRAMES, "paper_only": True}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "connected": market["connected"], "market": market}
-
+    return {"ok": True, "source": "TradingView", "feed_status": market["feed_status"]}
 
 @app.get("/state")
 def state():
-    return {
-        "mode": "PAPER_ONLY",
-        "strategy": {
-            "impulse_bars": IMPULSE_BARS,
-            "min_dxy_impulse_atr": MIN_IMPULSE_ATR,
-            "max_gold_move_atr": MAX_GOLD_MOVE_ATR,
-            "dxy_retrace_percent": RETRACE_PCT * 100,
-            "exit_reversal_percent": EXIT_REVERSAL_PCT * 100,
-            "confirmations_needed": CONFIRMATIONS_NEEDED,
-            "risk_pct": RISK_PCT * 100,
-            "correlation_filter": USE_CORRELATION_FILTER,
-            "max_setup_age_bars": MAX_SETUP_AGE,
-            "optimized_data_mode": LIVE_WS_MODE,
-            "history_batch_delay_seconds": HISTORY_BATCH_DELAY_SECONDS,
-            "dxy_rest_poll_seconds": DXY_REST_POLL_SECONDS,
-        },
-        "market": market,
-        "agents": list(agents.values()),
-        "events": events[:30],
-    }
-
+    with lock:
+        return {
+            "ok": True,
+            "paper_only": True,
+            "engine": {"status": "RUNNING", "source": "TradingView"},
+            "market": dict(market),
+            "agents": [dict(agents[tf]) for tf in TIMEFRAMES],
+            "events": list(events)
+        }
 
 @app.post("/paper/reset")
-def reset():
-    for a in agents.values():
-        a.update(
-            {
-                "balance": START_BALANCE,
-                "equity": START_BALANCE,
-                "pnl": 0.0,
-                "position": None,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-                "last_signal": None,
-                "setup": None,
-            }
-        )
+def paper_reset():
+    reset_all()
     add_event("All paper accounts reset.")
-    return {"ok": True, "start_balance": START_BALANCE}
+    return {"ok": True}
+
+def update_mark_to_market(a, price):
+    if a["position"] == "LONG":
+        unreal = (price - a["entry"]) * a["qty"]
+    elif a["position"] == "SHORT":
+        unreal = (a["entry"] - price) * a["qty"]
+    else:
+        unreal = 0.0
+    a["equity"] = a["balance"] + unreal
+    a["pnl"] = a["equity"] - START_BALANCE
+
+def close_position(a, price, reason):
+    if a["position"] == "LONG":
+        realized = (price - a["entry"]) * a["qty"]
+    else:
+        realized = (a["entry"] - price) * a["qty"]
+    a["balance"] += realized
+    a["equity"] = a["balance"]
+    a["pnl"] = a["balance"] - START_BALANCE
+    a["trades"] += 1
+    if realized >= 0:
+        a["wins"] += 1
+    else:
+        a["losses"] += 1
+    old = a["position"]
+    a.update({"position": "FLAT", "qty": 0.0, "entry": None, "stop": None, "last_signal": f"EXIT {old} / {reason}"})
+    add_event(f"{a['timeframe']} {old} EXIT {reason} @ {price:.4f}, realized {realized:+.2f}")
+
+def open_position(a, side, price, atr, reason):
+    if a["position"] != "FLAT":
+        return False
+    if sum(1 for x in agents.values() if x["position"] != "FLAT") >= MAX_POSITIONS:
+        return False
+    stop_dist = max(float(atr or 0) * 1.5, price * 0.001)
+    risk_cash = max(a["equity"], 0) * (RISK_PCT / 100.0)
+    qty = risk_cash / stop_dist if stop_dist > 0 else 0
+    if qty <= 0:
+        return False
+    stop = price - stop_dist if side == "LONG" else price + stop_dist
+    a.update({"position": side, "qty": qty, "entry": price, "stop": stop, "last_signal": f"ENTRY {side} / {reason}"})
+    add_event(f"{a['timeframe']} {side} ENTRY @ {price:.4f}, qty {qty:.4f}, stop {stop:.4f}")
+    return True
+
+@app.post("/webhook/tradingview")
+async def tradingview_webhook(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Webhook body must be JSON")
+
+    if data.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    tf = str(data.get("timeframe", ""))
+    if tf not in agents:
+        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
+
+    event = str(data.get("event", "bar"))
+    price = float(data.get("gold_price") or 0)
+    dxy = float(data.get("dxy_price") or 0)
+    atr = float(data.get("gold_atr") or 0)
+    side = str(data.get("side", "FLAT"))
+
+    with lock:
+        a = agents[tf]
+        if price <= 0:
+            raise HTTPException(status_code=400, detail="Missing gold_price")
+        market["gold"] = price
+        market["dxy"] = dxy or market["dxy"]
+        market["last_update"] = datetime.now(timezone.utc).isoformat()
+        market["feed_status"] = "LIVE_TRADINGVIEW"
+        a["last_price"] = price
+        a["last_dxy"] = dxy or a["last_dxy"]
+        a["last_update"] = market["last_update"]
+
+        # Server-side protective stop as an additional safety layer.
+        if a["position"] == "LONG" and a["stop"] and price <= a["stop"]:
+            close_position(a, price, "server_stop")
+        elif a["position"] == "SHORT" and a["stop"] and price >= a["stop"]:
+            close_position(a, price, "server_stop")
+
+        if event == "entry":
+            if side in ("LONG", "SHORT"):
+                open_position(a, side, price, atr, str(data.get("reason", "TradingView signal")))
+        elif event == "exit":
+            if a["position"] != "FLAT":
+                close_position(a, price, str(data.get("reason", "TradingView exit")))
+
+        update_mark_to_market(a, price)
+
+    return {"ok": True, "received": event, "timeframe": tf}
+
+@app.post("/webhook/test")
+async def webhook_test(request: Request):
+    data = await request.json()
+    if data.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    return {"ok": True, "message": "Webhook authentication works."}
