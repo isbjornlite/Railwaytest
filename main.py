@@ -1,177 +1,288 @@
 import os
-import time
-from collections import defaultdict, deque
+import json
+import sqlite3
+import logging
 from datetime import datetime, timezone
-from threading import Lock
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-START_BALANCE = float(os.getenv("START_BALANCE", "10000"))
-WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "CHANGE_ME")
-RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "4"))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dxy-gold-paper")
 
-TIMEFRAMES = ["15m", "30m", "1H", "4H"]
-AGENT_NAMES = {"15m": "Momentum", "30m": "Intraday", "1H": "Swing", "4H": "Macro"}
+TV_WEBHOOK_SECRET = os.environ.get("TV_WEBHOOK_SECRET", "")
+START_BALANCE = float(os.environ.get("START_BALANCE", "10000"))
+RISK_PCT = float(os.environ.get("RISK_PCT", "1.0"))
+DB_PATH = os.environ.get("DB_PATH", "/data/paper.db")
 
-app = FastAPI(title="DXY Gold TradingView Paper Engine", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+VALID_TIMEFRAMES = {"15m", "30m", "1H", "4H"}
+CONTRACT_SIZE_OZ_PER_LOT = 100.0  # standard XAUUSD lot
 
-lock = Lock()
-events = deque(maxlen=150)
-agents = {}
-for tf in TIMEFRAMES:
-    agents[tf] = {
-        "timeframe": tf, "name": AGENT_NAMES[tf], "balance": START_BALANCE,
-        "equity": START_BALANCE, "pnl": 0.0, "position": "FLAT",
-        "qty": 0.0, "entry": None, "stop": None, "last_price": None,
-        "last_dxy": None, "last_update": None, "trades": 0, "wins": 0, "losses": 0,
-        "last_signal": None
-    }
+app = FastAPI(title="DXY Gold Paper Trading Engine")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
-market = {
-    "gold": None, "dxy": None, "correlation": None, "source": "TradingView",
-    "last_update": None, "feed_status": "WAITING_FOR_TRADINGVIEW"
-}
 
-def add_event(msg, payload=None):
-    item = {"time": datetime.now(timezone.utc).isoformat(), "message": msg, "payload": payload}
-    with lock:
-        events.appendleft(item)
-    print(f"[TV-PAPER] {msg}", flush=True)
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) if os.path.dirname(DB_PATH) else None
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def reset_all():
-    with lock:
-        for tf in TIMEFRAMES:
-            a = agents[tf]
-            a.update({
-                "balance": START_BALANCE, "equity": START_BALANCE, "pnl": 0.0,
-                "position": "FLAT", "qty": 0.0, "entry": None, "stop": None,
-                "last_price": None, "last_dxy": None, "last_update": None,
-                "trades": 0, "wins": 0, "losses": 0, "last_signal": None
-            })
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS agents (
+            timeframe TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'flat',
+            side TEXT,
+            entry_price REAL,
+            entry_dxy REAL,
+            stop_price REAL,
+            size_oz REAL,
+            opened_at TEXT,
+            current_gold REAL,
+            current_dxy REAL,
+            last_signal TEXT,
+            last_update TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timeframe TEXT,
+            event TEXT,
+            side TEXT,
+            reason TEXT,
+            gold_price REAL,
+            dxy_price REAL,
+            pnl REAL,
+            balance_after REAL,
+            raw TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS processed_keys (
+            dedup_key TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+    c.execute("SELECT COUNT(*) as n FROM account")
+    if c.fetchone()["n"] == 0:
+        c.execute("INSERT INTO account (id, balance) VALUES (1, ?)", (START_BALANCE,))
+    for tf in VALID_TIMEFRAMES:
+        c.execute("INSERT OR IGNORE INTO agents (timeframe, status) VALUES (?, 'flat')", (tf,))
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+class WebhookPayload(BaseModel):
+    secret: str
+    source: Optional[str] = None
+    event: str
+    timeframe: str
+    symbol: Optional[str] = None
+    dxy_symbol: Optional[str] = None
+    gold_price: float
+    dxy_price: float
+    gold_atr: Optional[float] = None
+    dxy_impulse_atr: Optional[float] = None
+    gold_move_atr: Optional[float] = None
+    confirmations: Optional[str] = None
+    side: Optional[str] = None
+    reason: Optional[str] = None
+    tv_position: Optional[str] = None
+    bar_time: str
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "DXY Gold TradingView Paper Engine", "timeframes": TIMEFRAMES, "paper_only": True}
+    return {"service": "dxy-gold-paper-trading-engine", "status": "ok", "real_trading": False}
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "source": "TradingView", "feed_status": market["feed_status"]}
+    return {"status": "ok", "time": now_iso()}
+
 
 @app.get("/state")
-def state():
-    with lock:
-        return {
-            "ok": True,
-            "paper_only": True,
-            "engine": {"status": "RUNNING", "source": "TradingView"},
-            "market": dict(market),
-            "agents": [dict(agents[tf]) for tf in TIMEFRAMES],
-            "events": list(events)
-        }
+def get_state():
+    conn = get_db()
+    c = conn.cursor()
+    balance = c.execute("SELECT balance FROM account WHERE id = 1").fetchone()["balance"]
+
+    agents = []
+    unrealized_total = 0.0
+    last_gold, last_dxy = None, None
+    for row in c.execute("SELECT * FROM agents ORDER BY timeframe"):
+        row = dict(row)
+        unrealized = None
+        if row["status"] == "open" and row["current_gold"] is not None and row["entry_price"] is not None:
+            direction = 1 if row["side"] == "long" else -1
+            unrealized = (row["current_gold"] - row["entry_price"]) * direction * (row["size_oz"] or 0)
+            unrealized_total += unrealized
+        if row["current_gold"] is not None:
+            last_gold = row["current_gold"]
+        if row["current_dxy"] is not None:
+            last_dxy = row["current_dxy"]
+        agents.append({
+            "timeframe": row["timeframe"],
+            "status": row["status"],
+            "side": row["side"],
+            "entry_price": row["entry_price"],
+            "current_price": row["current_gold"],
+            "stop": row["stop_price"],
+            "size_oz": row["size_oz"],
+            "unrealized_pnl": unrealized,
+            "last_signal": row["last_signal"],
+            "last_update": row["last_update"],
+        })
+
+    events = [dict(r) for r in c.execute(
+        "SELECT * FROM events ORDER BY id DESC LIMIT 50"
+    )]
+    conn.close()
+
+    return {
+        "status": "ok",
+        "real_trading": False,
+        "balance": balance,
+        "equity": balance + unrealized_total,
+        "dxy_price": last_dxy,
+        "gold_price": last_gold,
+        "agents": agents,
+        "recent_events": events,
+    }
+
 
 @app.post("/paper/reset")
 def paper_reset():
-    reset_all()
-    add_event("All paper accounts reset.")
-    return {"ok": True}
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE account SET balance = ? WHERE id = 1", (START_BALANCE,))
+    c.execute("DELETE FROM agents")
+    for tf in VALID_TIMEFRAMES:
+        c.execute("INSERT INTO agents (timeframe, status) VALUES (?, 'flat')", (tf,))
+    c.execute("DELETE FROM events")
+    c.execute("DELETE FROM processed_keys")
+    conn.commit()
+    conn.close()
+    log.info("Paper account reset to %s", START_BALANCE)
+    return {"status": "ok", "balance": START_BALANCE}
 
-def update_mark_to_market(a, price):
-    if a["position"] == "LONG":
-        unreal = (price - a["entry"]) * a["qty"]
-    elif a["position"] == "SHORT":
-        unreal = (a["entry"] - price) * a["qty"]
-    else:
-        unreal = 0.0
-    a["equity"] = a["balance"] + unreal
-    a["pnl"] = a["equity"] - START_BALANCE
 
-def close_position(a, price, reason):
-    if a["position"] == "LONG":
-        realized = (price - a["entry"]) * a["qty"]
-    else:
-        realized = (a["entry"] - price) * a["qty"]
-    a["balance"] += realized
-    a["equity"] = a["balance"]
-    a["pnl"] = a["balance"] - START_BALANCE
-    a["trades"] += 1
-    if realized >= 0:
-        a["wins"] += 1
-    else:
-        a["losses"] += 1
-    old = a["position"]
-    a.update({"position": "FLAT", "qty": 0.0, "entry": None, "stop": None, "last_signal": f"EXIT {old} / {reason}"})
-    add_event(f"{a['timeframe']} {old} EXIT {reason} @ {price:.4f}, realized {realized:+.2f}")
+def log_event(c, timeframe, event, side, reason, gold_price, dxy_price, pnl, balance_after, raw):
+    c.execute(
+        """INSERT INTO events
+           (timeframe, event, side, reason, gold_price, dxy_price, pnl, balance_after, raw, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (timeframe, event, side, reason, gold_price, dxy_price, pnl, balance_after, raw, now_iso()),
+    )
 
-def open_position(a, side, price, atr, reason):
-    if a["position"] != "FLAT":
-        return False
-    if sum(1 for x in agents.values() if x["position"] != "FLAT") >= MAX_POSITIONS:
-        return False
-    stop_dist = max(float(atr or 0) * 1.5, price * 0.001)
-    risk_cash = max(a["equity"], 0) * (RISK_PCT / 100.0)
-    qty = risk_cash / stop_dist if stop_dist > 0 else 0
-    if qty <= 0:
-        return False
-    stop = price - stop_dist if side == "LONG" else price + stop_dist
-    a.update({"position": side, "qty": qty, "entry": price, "stop": stop, "last_signal": f"ENTRY {side} / {reason}"})
-    add_event(f"{a['timeframe']} {side} ENTRY @ {price:.4f}, qty {qty:.4f}, stop {stop:.4f}")
-    return True
 
 @app.post("/webhook/tradingview")
 async def tradingview_webhook(request: Request):
+    body = await request.json()
     try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Webhook body must be JSON")
+        payload = WebhookPayload(**body)
+    except Exception as e:
+        log.warning("Bad webhook payload: %s", e)
+        raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
 
-    if data.get("secret") != WEBHOOK_SECRET:
+    if not TV_WEBHOOK_SECRET or payload.secret != TV_WEBHOOK_SECRET:
+        log.warning("Webhook secret mismatch for timeframe=%s", payload.timeframe)
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
-    tf = str(data.get("timeframe", ""))
-    if tf not in agents:
-        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
+    if payload.timeframe not in VALID_TIMEFRAMES:
+        raise HTTPException(status_code=400, detail=f"Unknown timeframe {payload.timeframe}")
 
-    event = str(data.get("event", "bar"))
-    price = float(data.get("gold_price") or 0)
-    dxy = float(data.get("dxy_price") or 0)
-    atr = float(data.get("gold_atr") or 0)
-    side = str(data.get("side", "FLAT"))
+    dedup_key = f"{payload.timeframe}:{payload.event}:{payload.bar_time}:{payload.side or ''}"
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO processed_keys (dedup_key, created_at) VALUES (?, ?)", (dedup_key, now_iso()))
+    except sqlite3.IntegrityError:
+        conn.close()
+        log.info("Duplicate webhook ignored: %s", dedup_key)
+        return {"status": "ok", "duplicate": True}
 
-    with lock:
-        a = agents[tf]
-        if price <= 0:
-            raise HTTPException(status_code=400, detail="Missing gold_price")
-        market["gold"] = price
-        market["dxy"] = dxy or market["dxy"]
-        market["last_update"] = datetime.now(timezone.utc).isoformat()
-        market["feed_status"] = "LIVE_TRADINGVIEW"
-        a["last_price"] = price
-        a["last_dxy"] = dxy or a["last_dxy"]
-        a["last_update"] = market["last_update"]
+    agent = dict(c.execute("SELECT * FROM agents WHERE timeframe = ?", (payload.timeframe,)).fetchone())
+    balance = c.execute("SELECT balance FROM account WHERE id = 1").fetchone()["balance"]
 
-        # Server-side protective stop as an additional safety layer.
-        if a["position"] == "LONG" and a["stop"] and price <= a["stop"]:
-            close_position(a, price, "server_stop")
-        elif a["position"] == "SHORT" and a["stop"] and price >= a["stop"]:
-            close_position(a, price, "server_stop")
+    if payload.event == "bar":
+        c.execute(
+            "UPDATE agents SET current_gold=?, current_dxy=?, last_update=? WHERE timeframe=?",
+            (payload.gold_price, payload.dxy_price, now_iso(), payload.timeframe),
+        )
+        log_event(c, payload.timeframe, "bar", None, None, payload.gold_price, payload.dxy_price, None, balance, json.dumps(body))
 
-        if event == "entry":
-            if side in ("LONG", "SHORT"):
-                open_position(a, side, price, atr, str(data.get("reason", "TradingView signal")))
-        elif event == "exit":
-            if a["position"] != "FLAT":
-                close_position(a, price, str(data.get("reason", "TradingView exit")))
+    elif payload.event == "entry":
+        if agent["status"] == "open":
+            log.warning("Entry received but agent %s already open, ignoring", payload.timeframe)
+        else:
+            stop_distance = None
+            if payload.gold_atr:
+                stop_distance = payload.gold_atr * 1.5
+            risk_amount = balance * (RISK_PCT / 100.0)
+            size_oz = (risk_amount / stop_distance) if stop_distance and stop_distance > 0 else 0.0
+            stop_price = (
+                payload.gold_price - stop_distance if payload.side == "long"
+                else payload.gold_price + stop_distance
+            ) if stop_distance else None
 
-        update_mark_to_market(a, price)
+            c.execute(
+                """UPDATE agents SET status='open', side=?, entry_price=?, entry_dxy=?, stop_price=?,
+                   size_oz=?, opened_at=?, current_gold=?, current_dxy=?, last_signal=?, last_update=?
+                   WHERE timeframe=?""",
+                (payload.side, payload.gold_price, payload.dxy_price, stop_price, size_oz,
+                 payload.bar_time, payload.gold_price, payload.dxy_price,
+                 f"entry_{payload.side}", now_iso(), payload.timeframe),
+            )
+            log_event(c, payload.timeframe, "entry", payload.side, payload.reason,
+                      payload.gold_price, payload.dxy_price, None, balance, json.dumps(body))
 
-    return {"ok": True, "received": event, "timeframe": tf}
+    elif payload.event == "exit":
+        if agent["status"] != "open":
+            log.warning("Exit received but agent %s not open, ignoring", payload.timeframe)
+        else:
+            direction = 1 if agent["side"] == "long" else -1
+            pnl = (payload.gold_price - agent["entry_price"]) * direction * (agent["size_oz"] or 0)
+            new_balance = balance + pnl
+            c.execute("UPDATE account SET balance=? WHERE id=1", (new_balance,))
+            c.execute(
+                """UPDATE agents SET status='flat', side=NULL, entry_price=NULL, entry_dxy=NULL,
+                   stop_price=NULL, size_oz=NULL, opened_at=NULL, current_gold=?, current_dxy=?,
+                   last_signal=?, last_update=? WHERE timeframe=?""",
+                (payload.gold_price, payload.dxy_price, f"exit_{payload.reason}", now_iso(), payload.timeframe),
+            )
+            log_event(c, payload.timeframe, "exit", agent["side"], payload.reason,
+                      payload.gold_price, payload.dxy_price, pnl, new_balance, json.dumps(body))
+    else:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Unknown event type {payload.event}")
 
-@app.post("/webhook/test")
-async def webhook_test(request: Request):
-    data = await request.json()
-    if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
-    return {"ok": True, "message": "Webhook authentication works."}
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
